@@ -1,0 +1,14 @@
+[project]
+name = "blocks-backend-data"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi[standard]>=0.119.1",
+    "pandas>=2.3.3",
+    "pyarrow>=21.0.0",
+    "pyspark>=4.0.1",
+    "boto3>=1.35.0",
+    "s3fs>=2024.10.0",
+]
