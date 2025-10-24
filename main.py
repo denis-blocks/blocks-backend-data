@@ -4,6 +4,9 @@ from typing import List, Dict, Union, Optional
 from pydantic import BaseModel
 import pandas as pd
 from enum import Enum
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal, ROUND_HALF_UP
 
 # ---- Config ----
 S3_URI = "s3://blocks-lake/NewSoul/2025/10/newsoul-cur.snappy.parquet"
@@ -44,6 +47,10 @@ async def lifespan(app: FastAPI):
     """
     Load heavy resources once at startup and attach to app.state.
     """
+    # Create thread pool for CPU-bound pandas operations
+    executor = ThreadPoolExecutor(max_workers=4)
+    app.state.executor = executor
+
     try:
         # Requires s3fs + pyarrow installed. Credentials should be provided by env (e.g., AWS_* vars)
         df = pd.read_parquet(
@@ -75,8 +82,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        # Cleanup if needed
-        pass
+        # Cleanup executor
+        executor.shutdown(wait=True)
 
 app = FastAPI(lifespan=lifespan)
 
@@ -123,53 +130,50 @@ class APIRequest(BaseModel):
             raise ValueError("endDate is required and cannot be empty")
 
 class APIResponse(BaseModel):
-    data: List[Dict[str, Union[str, float]]]
+    data: List[Dict[str, Union[str, float, Decimal]]]
     groupBy: str
     filterBy: Dict[str, List[str]]
-    total: float
+    total: Union[float, Decimal]
     startDate: str
     endDate: str
 
-# ---- Routes ----
-@app.get("/api/filter")
-async def get_filter(
-    request: Request,
-    type: List[FilterType] = Query(..., description="Filter type(s): service, account, and/or region"),
-) -> Union[List[str], Dict[str, List[str]]]:
-    """
-    Get unique values for one or more filter types.
-    """
-    if not type:
-        raise HTTPException(status_code=400, detail="At least one filter type is required")
+    class Config:
+        # Enable arbitrary types to support Decimal
+        arbitrary_types_allowed = True
+        # Use string representation to avoid float precision issues
+        json_encoders = {
+            Decimal: lambda v: str(v)
+        }
 
-    df = request.app.state.df
-
+# ---- Helper Functions for Async Execution ----
+def _process_filter_sync(df: pd.DataFrame, filter_types: List[FilterType]) -> Union[List[str], Dict[str, List[str]]]:
+    """
+    Synchronous function to process filter requests (runs in thread pool).
+    """
     # Single type -> list response
-    if len(type) == 1:
-        column_name = FILTER_COLUMN_MAP.get(type[0].value)
+    if len(filter_types) == 1:
+        column_name = FILTER_COLUMN_MAP.get(filter_types[0].value)
         if not column_name:
-            raise HTTPException(status_code=400, detail=f"Invalid filter type: {type[0]}")
+            raise ValueError(f"Invalid filter type: {filter_types[0]}")
         unique_values = df[column_name].dropna().astype(str).unique().tolist()
         return sorted(unique_values)
 
     # Multiple types -> dict response
     result: Dict[str, List[str]] = {}
-    for filter_type in type:
+    for filter_type in filter_types:
         column_name = FILTER_COLUMN_MAP.get(filter_type.value)
         if not column_name:
-            raise HTTPException(status_code=400, detail=f"Invalid filter type: {filter_type}")
+            raise ValueError(f"Invalid filter type: {filter_type}")
         unique_values = df[column_name].dropna().astype(str).unique().tolist()
         result[filter_type.value] = sorted(unique_values)
 
     return result
 
-@app.post("/api/view", response_model=APIResponse)
-async def get_view(req: Request, payload: APIRequest):
-    """
-    Get aggregated cost data grouped by a specified field and filtered by various criteria.
-    """
-    df = req.app.state.df
 
+def _process_view_sync(df: pd.DataFrame, payload: APIRequest) -> APIResponse:
+    """
+    Synchronous function to process view requests (runs in thread pool).
+    """
     # Work on a copy
     filtered_df = df.copy()
 
@@ -222,7 +226,7 @@ async def get_view(req: Request, payload: APIRequest):
     # Determine group column
     group_column = GROUP_BY_COLUMN_MAP.get(payload.groupBy.value)
     if not group_column:
-        raise HTTPException(status_code=400, detail=f"Invalid groupBy value: {payload.groupBy}")
+        raise ValueError(f"Invalid groupBy value: {payload.groupBy}")
 
     # Extract date (daily)
     filtered_df["date"] = filtered_df["line_item_usage_start_date"].dt.date
@@ -239,14 +243,9 @@ async def get_view(req: Request, payload: APIRequest):
     else:
         all_groups = filtered_df[group_column].dropna().astype(str).unique().tolist()
 
-    # Aggregations
+    # Aggregations - only group by account and date for daily breakdown
     grouped = (
         filtered_df.groupby([group_column, "date"], dropna=False)["line_item_unblended_cost"]
-        .sum()
-        .reset_index()
-    )
-    group_totals = (
-        filtered_df.groupby(group_column, dropna=False)["line_item_unblended_cost"]
         .sum()
         .reset_index()
     )
@@ -262,24 +261,34 @@ async def get_view(req: Request, payload: APIRequest):
         # group_value might be non-string originally; ensure consistent matching & output
         group_value_str = str(group_value)
 
-        # total per group
-        group_row = group_totals[group_totals[group_column].astype(str) == group_value_str]
-        total_cost = float(group_row["line_item_unblended_cost"].iloc[0]) if len(group_row) else 0.0
-
-        # initialize row with totals and zeroed daily buckets
-        entry: Dict[str, Union[str, float]] = {"group": group_value_str, "cost": round(total_cost, 2)}
+        # initialize row with zeroed daily buckets (we'll calculate total from these)
+        entry: Dict[str, Union[str, float]] = {"group": group_value_str}
         for date_str in all_dates:
-            entry[date_str] = 0.0
+            entry[date_str] = Decimal("0")
 
-        # fill daily values
+        # fill daily values using Decimal for precision
         group_daily = grouped[grouped[group_column].astype(str) == group_value_str]
         for _, row in group_daily.iterrows():
             date_str = pd.to_datetime(row["date"]).strftime("%Y-%m-%d")
-            entry[date_str] = round(float(row["line_item_unblended_cost"]), 2)
+            # Convert to Decimal and quantize to remove floating point noise
+            # Quantize to 10 decimal places to remove float64 artifacts while preserving precision
+            decimal_value = Decimal(str(row["line_item_unblended_cost"]))
+            quantized = decimal_value.quantize(Decimal('0.0000000001'), rounding=ROUND_HALF_UP)
+            # Normalize to remove trailing zeros for clean output
+            entry[date_str] = quantized.normalize()
+
+        # Calculate total as sum of daily values shown in the response
+        total_cost = sum(entry[date_str] for date_str in all_dates)
+        # Quantize and normalize to match daily values
+        quantized_total = total_cost.quantize(Decimal('0.0000000001'), rounding=ROUND_HALF_UP)
+        entry["cost"] = quantized_total.normalize()
 
         data.append(entry)
 
-    total_cost = round(float(filtered_df["line_item_unblended_cost"].sum()), 2)
+    # Calculate overall total as sum of all daily values using Decimal
+    overall_total = Decimal(str(filtered_df["line_item_unblended_cost"].sum()))
+    quantized_overall = overall_total.quantize(Decimal('0.0000000001'), rounding=ROUND_HALF_UP)
+    total_cost = quantized_overall.normalize()
 
     return APIResponse(
         data=data,
@@ -289,6 +298,46 @@ async def get_view(req: Request, payload: APIRequest):
         startDate=payload.startDate,
         endDate=payload.endDate,
     )
+
+
+# ---- Routes ----
+@app.get("/api/filter")
+async def get_filter(
+    request: Request,
+    type: List[FilterType] = Query(..., description="Filter type(s): service, account, and/or region"),
+) -> Union[List[str], Dict[str, List[str]]]:
+    """
+    Get unique values for one or more filter types.
+    """
+    if not type:
+        raise HTTPException(status_code=400, detail="At least one filter type is required")
+
+    df = request.app.state.df
+    executor = request.app.state.executor
+
+    # Run pandas operations in thread pool to avoid blocking event loop
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(executor, _process_filter_sync, df, type)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/view", response_model=APIResponse)
+async def get_view(req: Request, payload: APIRequest):
+    """
+    Get aggregated cost data grouped by a specified field and filtered by various criteria.
+    """
+    df = req.app.state.df
+    executor = req.app.state.executor
+
+    # Run pandas operations in thread pool to avoid blocking event loop
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(executor, _process_view_sync, df, payload)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
